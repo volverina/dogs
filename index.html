@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Класифікатор порід собак</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tensorflow/4.10.0/tf.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        .container {
+            background: #f5f5f5;
+            padding: 20px;
+            border-radius: 8px;
+            margin-top: 20px;
+        }
+        
+        #imagePreview {
+            max-width: 400px;
+            max-height: 400px;
+            margin: 20px auto;
+            display: none;
+        }
+        
+        #result, #modelStatus {
+            margin-top: 20px;
+            font-size: 18px;
+        }
+        
+        #modelStatus.error {
+            color: red;
+        }
+        
+        button {
+            background: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 10px;
+        }
+        
+        button:disabled {
+            background: #cccccc;
+            cursor: not-allowed;
+        }
+        
+        button:hover:not(:disabled) {
+            background: #45a049;
+        }
+        
+        .loading {
+            display: none;
+            margin: 20px auto;
+        }
+
+        #debugInfo {
+            margin-top: 20px;
+            text-align: left;
+            font-family: monospace;
+            font-size: 12px;
+            padding: 10px;
+            background: #f0f0f0;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <h1>Класифікатор порід собак</h1>
+    
+    <div class="container">
+        <div id="modelStatus">Завантаження моделі...</div>
+        <input type="file" id="imageUpload" accept="image/*" style="display: none">
+        <button id="uploadButton" disabled onclick="document.getElementById('imageUpload').click()">
+            Завантажити зображення
+        </button>
+        <img id="imagePreview">
+        <div class="loading" id="loading">Обробка...</div>
+        <div id="result"></div>
+        <button onclick="toggleDebug()">Показати/приховати технічну інформацію</button>
+        <div id="debugInfo"></div>
+    </div>
+
+    <script>
+        let model;
+        const modelStatus = document.getElementById('modelStatus');
+        const uploadButton = document.getElementById('uploadButton');
+        const debugInfo = document.getElementById('debugInfo');
+        
+        function updateDebugInfo(message) {
+            const timestamp = new Date().toISOString();
+            debugInfo.innerHTML += `${timestamp}: ${message}<br>`;
+            console.log(message);
+        }
+
+        function toggleDebug() {
+            debugInfo.style.display = debugInfo.style.display === 'none' ? 'block' : 'none';
+        }
+
+        // Завантаження моделі
+        async function loadModel() {
+            updateDebugInfo('Початок завантаження моделі...');
+            try {
+                // Спробуємо спочатку завантажити як graph model
+                updateDebugInfo('Спроба завантаження як graph model...');
+                model = await tf.loadGraphModel('web_model/model.json');
+                updateDebugInfo('Модель успішно завантажена як graph model');
+            } catch (graphError) {
+                updateDebugInfo(`Помилка завантаження graph model: ${graphError.message}`);
+                try {
+                    // Якщо не вдалося, спробуємо як layered model
+                    updateDebugInfo('Спроба завантаження як layered model...');
+                    model = await tf.loadLayersModel('web_model/model.json');
+                    updateDebugInfo('Модель успішно завантажена як layered model');
+                } catch (layersError) {
+                    updateDebugInfo(`Помилка завантаження layered model: ${layersError.message}`);
+                    throw new Error(`Не вдалося завантажити модель: ${graphError.message} | ${layersError.message}`);
+                }
+            }
+            
+            modelStatus.textContent = 'Модель готова до використання';
+            modelStatus.className = '';
+            uploadButton.disabled = false;
+            updateDebugInfo('Модель повністю ініціалізована та готова до використання');
+        }
+        
+        // Завантаження зображення та попередній перегляд
+        document.getElementById('imageUpload').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (file) {
+                updateDebugInfo(`Завантажено файл: ${file.name} (${file.type})`);
+                
+                // Перевіряємо, чи це зображення
+                if (!file.type.startsWith('image/')) {
+                    alert('Будь ласка, завантажте файл зображення');
+                    return;
+                }
+
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const img = document.getElementById('imagePreview');
+                    img.onload = function() {
+                        updateDebugInfo(`Зображення завантажено: ${img.width}x${img.height}`);
+                        img.style.display = 'block';
+                        // Затримка для повного завантаження зображення
+                        setTimeout(() => classifyImage(img), 100);
+                    };
+                    img.onerror = function() {
+                        updateDebugInfo('Помилка завантаження зображення');
+                        alert('Помилка завантаження зображення');
+                    };
+                    img.src = e.target.result;
+                }
+                reader.onerror = function() {
+                    updateDebugInfo('Помилка читання файлу');
+                    alert('Помилка читання файлу');
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+
+        // Попередня обробка зображення
+        function preprocessImage(image) {
+            return tf.tidy(() => {
+                updateDebugInfo('Початок попередньої обробки зображення');
+                
+                // Перевіряємо, чи зображення завантажилось
+                if (!image.complete || !image.naturalHeight) {
+                    throw new Error('Зображення ще не завантажилось повністю');
+                }
+
+                // Перевіряємо розміри
+                updateDebugInfo(`Розміри зображення: ${image.width}x${image.height}`);
+                if (image.width === 0 || image.height === 0) {
+                    throw new Error('Неправильні розміри зображення');
+                }
+
+                // Створюємо тимчасовий canvas для обробки зображення
+                const canvas = document.createElement('canvas');
+                canvas.width = 224;
+                canvas.height = 224;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(image, 0, 0, 224, 224);
+
+                // Конвертуємо в тензор
+                let tensor = tf.browser.fromPixels(canvas)
+                    .toFloat();
+
+                // Нормалізація як у MobileNetV2
+                tensor = tensor.sub(127.5).div(127.5);
+                
+                updateDebugInfo('Попередня обробка зображення завершена');
+                return tensor.expandDims();
+            });
+        }
+
+        // Класифікація зображення
+        async function classifyImage(image) {
+            if (!model) {
+                const error = 'Модель ще не завантажена';
+                updateDebugInfo(error);
+                return;
+            }
+
+            const loading = document.getElementById('loading');
+            const result = document.getElementById('result');
+            
+            loading.style.display = 'block';
+            result.innerHTML = '';
+            
+            try {
+                updateDebugInfo('Початок класифікації зображення');
+                const tensor = preprocessImage(image);
+                
+                updateDebugInfo('Виконання передбачення');
+                const predictions = await model.predict(tensor).data();
+                
+                const topPrediction = Array.from(predictions)
+                    .map((prob, i) => ({prob, index: i}))
+                    .sort((a, b) => b.prob - a.prob)[0];
+
+                updateDebugInfo(`Отримано результат: клас ${topPrediction.index} з ймовірністю ${topPrediction.prob}`);
+                result.innerHTML = `Порода собаки: ${getDogBreed(topPrediction.index)} (${(topPrediction.prob * 100).toFixed(2)}%)`;
+            } catch (error) {
+                const errorMessage = `Помилка при класифікації: ${error.message}`;
+                updateDebugInfo(errorMessage);
+                result.innerHTML = errorMessage;
+            }
+
+            loading.style.display = 'none';
+        }
+
+        // Функція для отримання назви породи за індексом
+        function getDogBreed(index) {
+            const breeds = [
+                "Афганська гонча",
+                "Бассет-хаунд",
+                "Бігль",
+                "Бладхаунд",
+                "Бордер-коллі",
+                "Бордер-тер'єр",
+                "Бостон-тер'єр",
+                "Боксер",
+                "Бульдог",
+                "Бульмастиф",
+                "Чихуахуа",
+                "Чау-чау",
+                "Коллі",
+                "Далматин",
+                "Німецька вівчарка",
+                "Німецький короткошерстий пойнтер",
+                "Доберман",
+                "Англійський кокер-спанієль",
+                "Англійський сетер",
+                "Англійський спрингер-спанієль",
+                "Фокстер'єр",
+                "Французький бульдог",
+                "Золотистий ретривер",
+                "Великий швейцарський зенненхунд",
+                "Грейхаунд",
+                "Ірландський сетер",
+                "Ірландський тер'єр",
+                "Ірландський водяний спанієль",
+                "Італійський хорт",
+                "Японський спанієль",
+                "Кеесхонд",
+                "Керрі-блю-тер'єр",
+                "Лабрадор-ретривер",
+                "Лейкленд-тер'єр",
+                "Леонбергер",
+                "Лхаса-апсо",
+                "Мальтійська болонка",
+                "Мініатюрний пінчер",
+                "Мініатюрний пудель",
+                "Мініатюрний шнауцер",
+                "Ньюфаундленд",
+                "Норфолк-тер'єр",
+                "Норвезький елкхаунд",
+                "Норвіч-тер'єр",
+                "Пекінес",
+                "Померанський шпіц",
+                "Пудель",
+                "Мопс",
+                "Родезійський ріджбек",
+                "Ротвейлер",
+                "Сенбернар",
+                "Шотландський дирхаунд",
+                "Шотландський тер'єр",
+                "Шетландська вівчарка",
+                "Ши-тцу",
+                "Сибірський хаскі",
+                "Силіхем-тер'єр",
+                "Стаффордширський бультер'єр",
+                "Суссекс-спанієль",
+                "Тибетський мастиф",
+                "Тибетський тер'єр",
+                "Той-пудель",
+                "Той-тер'єр",
+                "Візла",
+                "Уельський спрингер-спанієль",
+                "Вест-хайленд-уайт-тер'єр",
+                "Уїппет",
+                "Йоркширський тер'єр"
+            ];
+            return breeds[index] || `Невідома порода (${index})`;
+        }
+
+        // Завантаження моделі при запуску сторінки
+        loadModel().catch(error => {
+            const errorMessage = `Помилка завантаження моделі: ${error.message}`;
+            modelStatus.textContent = errorMessage;
+            modelStatus.className = 'error';
+            updateDebugInfo(errorMessage);
+        });
+    </script>
+</body>
+</html>
